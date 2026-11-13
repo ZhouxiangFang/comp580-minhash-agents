@@ -64,7 +64,12 @@ python3 analyze.py sweep
 python3 analyze.py plots
 ```
 
-Results go to `results/<config>/<dataset>/rows.jsonl` (one row per task), with
-the agent's working directories and transcripts beside it. An interrupted run
+Results go to `../results/<config>/<dataset>/rows.jsonl` (one row per task; change
+the folder with `--out`), with the agent's working directories and transcripts
+beside it. An interrupted run
 continues where it stopped; `--fresh` starts over. `--limit 5` runs only the
 first five tasks of each dataset, which is a cheap way to check the setup.
+
+To reach the same model through OpenRouter instead of a Google key, put the key
+in `~/.config/spartacus/env` as `OPENAI_API_KEY` and add
+`--model openai:google/gemini-3.5-flash-lite --api-base https://openrouter.ai/api/v1`.

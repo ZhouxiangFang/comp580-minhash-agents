@@ -97,30 +97,37 @@ def use_openai_compatible(base):
     are adapted so the gateway behaves like the harness's own Gemini route:
     a tool result is sent as {"result": text} (the gateway drops one that is not
     a JSON object), the temperature is the 0.4 that route uses, and the model's
-    reasoning details are sent back with its earlier tool calls (that route does
-    the same with thought signatures; without them Gemini stops calling tools).
+    reasoning details and tool-call ids are sent back with its earlier tool calls
+    (that route does the same with thought signatures; without them Gemini stops
+    calling tools).
     """
     from spartacus import models, provider
     models.PROVIDERS["openai"]["base"] = base
     post = provider._post
-    details = {}                              # (system prompt, assistant turn) -> reasoning details
+    seen = {}                                 # (system prompt, assistant turn) -> (details, call ids)
 
     def adapted(url, body, headers, retries=5):
         if not url.endswith("/chat/completions"):
             return post(url, body, headers, retries)
-        run, turn, messages = body["messages"][0]["content"], 0, []
+        run, turn, messages, ids = body["messages"][0]["content"], 0, [], {}
         for message in body["messages"]:
             if message["role"] == "tool":
-                message = dict(message, content=json.dumps({"result": message["content"]}))
+                message = dict(message, content=json.dumps({"result": message["content"]}),
+                               tool_call_id=ids.get(message["tool_call_id"], message["tool_call_id"]))
             elif message["role"] == "assistant":
-                if (run, turn) in details:
-                    message = dict(message, reasoning_details=details[run, turn])
+                details, real_ids = seen.get((run, turn), (None, []))
+                calls = [dict(call) for call in message.get("tool_calls") or []]
+                if details and len(calls) == len(real_ids):
+                    for call, real in zip(calls, real_ids):
+                        ids[call["id"]], call["id"] = real, real
+                    message = dict(message, tool_calls=calls, reasoning_details=details)
                 turn += 1
             messages.append(message)
         data = post(url, dict(body, temperature=0.4, messages=messages), headers, retries)
         reply = (data.get("choices") or [{}])[0].get("message") or {}
         if reply.get("reasoning_details"):
-            details[run, turn] = reply["reasoning_details"]
+            seen[run, turn] = (reply["reasoning_details"],
+                               [call.get("id") for call in reply.get("tool_calls") or []])
         return data
 
     provider._post = adapted
@@ -236,6 +243,8 @@ def main():
     args.assignment_root = os.path.abspath(args.assignment_root)
     args.out = os.path.abspath(args.out)
     sys.path.insert(0, os.path.abspath(args.spartacus_root))
+    from spartacus import config
+    config.load()                             # read the key file once, before any worker thread
     if args.api_base:
         use_openai_compatible(args.api_base.rstrip("/"))
 
