@@ -90,49 +90,6 @@ def run_agent(args, workdir, session_path, cache):
     return used
 
 
-def use_openai_compatible(base):
-    """Reach the model through an OpenAI-compatible gateway (OpenRouter) instead of Google.
-
-    Only used with --api-base; the harness files stay as they are. Three things
-    are adapted so the gateway behaves like the harness's own Gemini route:
-    a tool result is sent as {"result": text} (the gateway drops one that is not
-    a JSON object), the temperature is the 0.4 that route uses, and the model's
-    reasoning details and tool-call ids are sent back with its earlier tool calls
-    (that route does the same with thought signatures; without them Gemini stops
-    calling tools).
-    """
-    from spartacus import models, provider
-    models.PROVIDERS["openai"]["base"] = base
-    post = provider._post
-    seen = {}                                 # (system prompt, assistant turn) -> (details, call ids)
-
-    def adapted(url, body, headers, retries=5):
-        if not url.endswith("/chat/completions"):
-            return post(url, body, headers, retries)
-        run, turn, messages, ids = body["messages"][0]["content"], 0, [], {}
-        for message in body["messages"]:
-            if message["role"] == "tool":
-                message = dict(message, content=json.dumps({"result": message["content"]}),
-                               tool_call_id=ids.get(message["tool_call_id"], message["tool_call_id"]))
-            elif message["role"] == "assistant":
-                details, real_ids = seen.get((run, turn), (None, []))
-                calls = [dict(call) for call in message.get("tool_calls") or []]
-                if details and len(calls) == len(real_ids):
-                    for call, real in zip(calls, real_ids):
-                        ids[call["id"]], call["id"] = real, real
-                    message = dict(message, tool_calls=calls, reasoning_details=details)
-                turn += 1
-            messages.append(message)
-        data = post(url, dict(body, temperature=0.4, messages=messages), headers, retries)
-        reply = (data.get("choices") or [{}])[0].get("message") or {}
-        if reply.get("reasoning_details"):
-            seen[run, turn] = (reply["reasoning_details"],
-                               [call.get("id") for call in reply.get("tool_calls") or []])
-        return data
-
-    provider._post = adapted
-
-
 def read_answer(workdir):
     try:
         with open(os.path.join(workdir, "answer.json"), encoding="utf-8") as handle:
@@ -224,8 +181,6 @@ def main():
     parser.add_argument("--datasets", nargs="+", default=DATASETS)
     parser.add_argument("--seed", type=int, default=0, help="seed of the MinHash hash functions")
     parser.add_argument("--model", default=MODEL)
-    parser.add_argument("--api-base", default=None,
-                        help="OpenAI-compatible endpoint for 'openai:<model>' ids, e.g. OpenRouter")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="task-level: estimated Jaccard a record needs to be considered")
     parser.add_argument("--content-threshold", type=float, default=0.5,
@@ -245,8 +200,6 @@ def main():
     sys.path.insert(0, os.path.abspath(args.spartacus_root))
     from spartacus import config
     config.load()                             # read the key file once, before any worker thread
-    if args.api_base:
-        use_openai_compatible(args.api_base.rstrip("/"))
 
     for config in args.config:
         with ThreadPoolExecutor(max_workers=args.jobs) as pool:
