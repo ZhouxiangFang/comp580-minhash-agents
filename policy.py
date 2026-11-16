@@ -1,21 +1,31 @@
 """Task-level reuse: answer an incoming task from a verified record of the same item.
 
-MinHash proposes, an exact check disposes. LSH retrieves verified records whose
-text is similar to the task; a record's answer is reused only if the two are the
-same text up to formatting: exactly the same words and numbers in the same
-order, or the same paragraphs in another order. One changed word, number or
-identifier blocks reuse, and so does a swap of two words inside a paragraph;
-that is what separates a duplicate from a hard negative that shares 90 % of its
-shingles.
+LSH retrieves the verified records with an estimated MinHash similarity to the
+task of at least `threshold` (0.5). Then:
 
-Nothing here knows a dataset. The fields to compare, the fields that hold a
-record's answer and the shape of an answer are all read off the data:
-  * compared text  = the fields a task shares with the history records
-                     (dates are skipped: they say when a record was filed);
+  * The data has key fields: the most similar record whose key fields all equal
+    the task's is reused, unless another such record has a different answer.
+  * The data has no key fields: a record that is the same text as the task up
+    to formatting (the same words and numbers in the same order,
+    or the same paragraphs in another order) is reused. With
+    `no_key_rule="similarity"` the most similar record is reused regardless.
+
+Nothing here knows a dataset. The fields to compare, the key fields, the fields
+that hold a record's answer and the shape of an answer are all read off the data:
+  * compared text  = the fields a task shares with the history records. A field
+                     whose whole value is a date or timestamp is skipped: it
+                     says when a record was filed, and a duplicate always
+                     arrives later. Dates inside text or inside a nested value
+                     are compared like any other number;
+  * key fields     = compared fields whose value in every history record is one
+                     token-like scalar (no whitespace, not a date), such as a
+                     product, an error code or a scenario id;
   * a record's answer = the fields history records have and tasks do not.
 """
 
+import json
 import re
+import time
 from collections import Counter
 
 from minhash import LSHIndex, MinHasher, shingles, tokenize
@@ -24,14 +34,14 @@ _DATE = re.compile(r"\d{4}-\d{2}-\d{2}([T ][\d:.]+)?(Z|[+-]\d{2}:?\d{2})?")
 
 
 def _leaves(value):
-    """Every scalar inside a JSON value, in order, without dates and nulls."""
+    """Every non-null scalar inside a JSON value, including dates and numbers."""
     if isinstance(value, dict):
         for key in sorted(value):
             yield from _leaves(value[key])
     elif isinstance(value, (list, tuple)):
         for item in value:
             yield from _leaves(item)
-    elif value is not None and not _DATE.fullmatch(str(value).strip()):
+    elif value is not None:
         yield str(value)
 
 
@@ -40,40 +50,70 @@ def _same_text(entry, words, blocks):
     return entry["words"] == words or entry["blocks"] == blocks
 
 
+def _same_answer(first, second):
+    """True when two answers agree on every key they share (and share at least one)."""
+    common = set(first) & set(second)
+    return bool(common) and all(json.dumps(first[k], sort_keys=True) ==
+                                json.dumps(second[k], sort_keys=True) for k in common)
+
+
+def _is_short(value):
+    """One token-like scalar: no whitespace and not a date. An empty field counts."""
+    if value is None:
+        return True
+    if not isinstance(value, (str, int, float)):
+        return False
+    text = str(value).strip()
+    return not re.search(r"\s", text) and not _DATE.fullmatch(text)
+
+
 class ReusePolicy:
     """An index of verified records and the rule for reusing one of their answers.
 
-    `lookup(task)` returns `{"answer", "source", "similarity"}` or None;
+    `lookup(task)` returns `{"answer", "source", "similarity", "layer"}` or None,
+    where layer is "key", "exact" or "similarity" (the rule that accepted it).
     `add(task, answer)` indexes a new answer and must only be called after the
-    answer passed verification. `validate=False` drops the exact check and reuses
-    on similarity alone; it exists for the threshold ablation, not for real use.
+    answer passed verification.
     """
 
-    def __init__(self, history, threshold=0.5, validate=True, seed=0):
+    def __init__(self, history, threshold=0.5, no_key_rule="exact", seed=0):
+        if no_key_rule not in ("exact", "similarity"):
+            raise ValueError("no_key_rule must be 'exact' or 'similarity'")
         self.history = list(history)
-        self.threshold = threshold
-        self.validate = validate
+        self.threshold = threshold            # similarity a candidate needs
+        self.no_key_rule = no_key_rule        # what decides when the data has no key fields
         self.hasher = MinHasher(seed=seed)
         self.history_fields = set().union(*self.history) if self.history else set()
         self.fields = None        # compared fields, fixed by the first task seen
+        self.key_fields = []      # short single-token fields, fixed with the compared fields
         self.answer_keys = None   # keys of verified answers seen so far
         self.pointers = {}        # answer key -> history field holding its value
         self.pending = []         # answers added before the index existed
+        self.index_build_seconds = 0.0
 
     # -- public ---------------------------------------------------------------
     def lookup(self, task):
         self._ensure_index(task)
         words, blocks = self._text(task)
+        task_key = self._key(task)
+        layer = "key" if self.key_fields else self.no_key_rule
+        matches = []
         for key, estimate in self.index.search(self._signature(words), self.threshold):
-            entry = self.entries[key]
-            if self.validate and not _same_text(entry, words, blocks):
-                continue                      # similar, but not the same item
-            if self.validate and entry["ambiguous"]:
-                return None                   # same text is known to carry two answers
+            entry = self.entries[key]         # best first
+            if layer == "key" and entry["key"] != task_key:
+                continue
+            if layer == "exact" and not _same_text(entry, words, blocks):
+                continue
             answer = self._answer(entry)
             if answer is not None:
-                return {"answer": answer, "source": entry["id"], "similarity": estimate}
-        return None
+                matches.append((key, answer, estimate))
+                if layer != "key":
+                    break                     # without key fields the best match is used
+        if not matches or any(not _same_answer(matches[0][1], other) for _, other, _ in matches[1:]):
+            return None                       # nothing matched, or matching records disagree
+        key, answer, estimate = matches[0]
+        return {"answer": answer, "source": self.entries[key]["id"],
+                "similarity": estimate, "layer": layer}
 
     def add(self, task, answer):
         """Index a verified answer and learn the shape of answers from it."""
@@ -94,6 +134,7 @@ class ReusePolicy:
         fields = sorted(set(task) & self.history_fields) or sorted(task)
         if fields == self.fields:
             return
+        started = time.perf_counter()
         self.fields = fields
         self.payload = sorted(self.history_fields - set(task))
         self.field_values = {f: {str(r[f]) for r in self.history if f in r} for f in self.payload}
@@ -101,16 +142,22 @@ class ReusePolicy:
         self.id_fields = [f for f in self.payload
                           if len(self.field_values[f]) == len(self.history)
                           and all(isinstance(r.get(f), str) and list(_leaves(r[f]))
+                                  and not _DATE.fullmatch(r[f].strip())
                                   for r in self.history)]
-        self.index = LSHIndex()
+        self.key_fields = [f for f in self.fields
+                           if all(_is_short(r.get(f)) for r in self.history)
+                           and any(r.get(f) is not None for r in self.history)]
+        # Two rows per band: at similarity 0.4 a pair still shares a band with
+        # probability above 0.99, so candidates near the threshold are found.
+        self.index = LSHIndex(bands=64)
         self.entries = {}
         for position, record in enumerate(self.history):
             name = record[self.id_fields[0]] if self.id_fields else position
             self._insert(record, name, None)
-        self._flag_ambiguous()
         pending, self.pending = self.pending, []
         for old_task, answer in pending:
             self.add(old_task, answer)
+        self.index_build_seconds += time.perf_counter() - started
 
     def _text(self, record):
         """The compared text as (all words in order, the bag of its paragraphs).
@@ -122,12 +169,19 @@ class ReusePolicy:
         blocks = []
         for field in self.fields:
             value = record.get(field)
+            if isinstance(value, str) and _DATE.fullmatch(value.strip()):
+                continue                      # a date field: when it was filed, not what it says
             parts = re.split(r"\n\s*\n", value) if isinstance(value, str) else [value]
             for part in parts:
                 words = tokenize(" ".join(_leaves(part)))
                 if words:
                     blocks.append(tuple(words))
         return tuple(w for block in blocks for w in block), Counter(blocks)
+
+    def _key(self, record):
+        """The key fields' values, compared like any other tokens (case, identifier hyphens)."""
+        return tuple(tuple(tokenize(str(record.get(f)))) if record.get(f) is not None else ()
+                     for f in self.key_fields)
 
     def _signature(self, words):
         return self.hasher.signature(shingles(words))
@@ -136,22 +190,8 @@ class ReusePolicy:
         words, blocks = self._text(record)
         key = len(self.entries)
         self.entries[key] = {"id": name, "words": words, "blocks": blocks, "record": record,
-                             "answer": answer, "ambiguous": False}
+                             "answer": answer, "key": self._key(record)}
         self.index.add(key, self._signature(words))
-
-    def _flag_ambiguous(self):
-        """Never reuse a history record whose exact twin in history has another answer."""
-        for key, entry in self.entries.items():
-            for other, _ in self.index.search(self.index.signatures[key], self.threshold):
-                twin = self.entries[other]
-                if other != key and _same_text(twin, entry["words"], entry["blocks"]) \
-                        and self._verdict(twin["record"]) != self._verdict(entry["record"]):
-                    entry["ambiguous"] = True
-
-    def _verdict(self, record):
-        """What a history record says the answer is, without its id and dates."""
-        return {f: record.get(f) for f in self.payload
-                if f not in self.id_fields and list(_leaves(record.get(f)))}
 
     # -- answers --------------------------------------------------------------
     def _answer(self, entry):

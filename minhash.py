@@ -18,18 +18,37 @@ from collections import defaultdict
 NUM_PERM = 128           # hash functions per signature
 SHINGLE_WORDS = 3        # words per shingle
 PRIME = (1 << 61) - 1    # modulus of the universal hash family
-_WORD = re.compile(r"[a-z]+|[0-9]+")
+_SIGN = r"[+\-\N{MINUS SIGN}]"
+_TIME = r"\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:z|[+\-]\d{2}:?\d{2})?"
+_DATE = rf"\d{{4}}-\d{{2}}-\d{{2}}(?:[t ]{_TIME})?"
+_DIGITS = r"(?:\d{1,3}(?:,\d{3})+|\d+(?:_\d+)*)"
+_NUMBER = rf"{_SIGN}?(?:{_DIGITS}(?:\.\d+)?|\.\d+)(?:e{_SIGN}?\d+)?"
+_TOKEN = re.compile(
+    rf"{_DATE}|{_TIME}|{_SIGN}?\d+(?:\.\d+){{2,}}|{_NUMBER}"
+    r"|(?P<word>[^\W\d]\w*(?:[-.]\w+)*)"  # words and identifiers, including E-1042 and v3.1.4
+    rf"|{_SIGN}"                  # also retain a sign separated from its number
+)
 
 
-def tokenize(text, mask_numbers=False):
-    """Lower-case words and numbers; `E-1042`, `e1042` and `E 1042` give the same tokens.
+def tokenize(text):
+    """Lower-case tokens, preserving numeric spelling rather than masking values.
 
-    With `mask_numbers` every number becomes "0", so two texts that differ only in
-    their numbers look alike. That is right for finding repeated tool output (an
-    exact diff restores the numbers) and wrong for task identity, where it is off.
+    Signed integers, decimals, scientific notation, grouped digits, ISO dates,
+    times and dotted versions/IPs stay intact. No float conversion or numeric
+    rounding is used: -10 differs from +10, 3.14 from 3 14, and 1e-3 from 1e3.
+
+    An identifier that mixes letters and digits is compared without its hyphens,
+    so E-1042 and E1042 are one token (E-1042 and E-1043 are still two). Only
+    hyphens inside such identifiers are dropped: numbers, dates, dots and plain
+    words keep their spelling.
     """
-    words = _WORD.findall(str(text).lower())
-    return ["0" if w.isdigit() else w for w in words] if mask_numbers else words
+    tokens = []
+    for match in _TOKEN.finditer(str(text).lower()):
+        token = match.group()
+        if match.lastgroup == "word" and "-" in token and any(c.isdigit() for c in token):
+            token = token.replace("-", "")
+        tokens.append(token)
+    return tokens
 
 
 def shingles(tokens, k=SHINGLE_WORDS):

@@ -67,11 +67,14 @@ def make_workdir(env, task, workdir):
                 shutil.copytree(os.path.join(scenarios, name), workdir, dirs_exist_ok=True)
 
 
-def run_agent(args, workdir, session_path, cache):
-    """Run the agent on one working directory; return its request, tool and token counts."""
+def run_agent(args, workdir, session_path, cache, used):
+    """Run the agent on one working directory, adding its requests, tool calls and tokens to `used`.
+
+    The counts are added as the events arrive, so a run that fails part-way (an API
+    error after the harness's retries) still reports what it used up to the failure.
+    """
     from spartacus import Harness
     from spartacus.tools import core_tools
-    used = {"model_requests": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0}
 
     def on_event(kind, payload):
         if kind == "assistant":
@@ -87,7 +90,6 @@ def run_agent(args, workdir, session_path, cache):
                     enable_subagents=False, session_path=session_path,
                     extra_tools=wrap_tools(core_tools(workdir), cache) if cache else None)
     agent.run(PROMPT)
-    return used
 
 
 def read_answer(workdir):
@@ -120,7 +122,13 @@ def run_dataset(args, dataset, config):
     if os.path.exists(rows_path) and not args.fresh:
         with open(rows_path, encoding="utf-8") as handle:
             done = {row["tid"]: row for row in map(json.loads, handle)}
-    policy = ReusePolicy(history, threshold=args.threshold, seed=args.seed) if use_policy else None
+    policy = None
+    policy_init_seconds = 0.0
+    if use_policy:
+        started = time.perf_counter()
+        policy = ReusePolicy(history, threshold=args.threshold, no_key_rule=args.no_key_rule,
+                             seed=args.seed)
+        policy_init_seconds = time.perf_counter() - started
 
     with open(rows_path, "a" if done else "w", encoding="utf-8") as log:
         for task in tasks:
@@ -135,41 +143,56 @@ def run_dataset(args, dataset, config):
             if os.path.exists(session_path):  # a transcript left by an earlier, discarded run
                 os.remove(session_path)
             row = {"dataset": dataset, "config": config, "tid": tid, "seq": task.get("seq"),
-                   "reused": False, "source": None, "similarity": None, "error": None,
+                   "reused": False, "source": None, "similarity": None, "reuse_layer": None,
+                   "error": None,
                    "model_requests": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0,
                    "policy_seconds": 0.0, "content_seconds": 0.0,
+                   "index_build_seconds": 0.0,
                    "content_chars_in": 0, "content_chars_out": 0, "content_folds": 0}
             started = time.perf_counter()
+            built_before = policy.index_build_seconds if policy else 0.0
             match = policy.lookup(task) if policy else None
-            row["policy_seconds"] = time.perf_counter() - started
+            if policy:
+                # The lazy build is already inside lookup's timer. Expose it as
+                # a subset of policy_seconds; only initialization is added.
+                row["index_build_seconds"] = (policy.index_build_seconds - built_before
+                                              + policy_init_seconds)
+                row["policy_seconds"] = time.perf_counter() - started + policy_init_seconds
             if match:
-                row.update(reused=True, source=str(match["source"]), similarity=match["similarity"])
+                row.update(reused=True, source=str(match["source"]), similarity=match["similarity"],
+                           reuse_layer=match["layer"])
                 with open(os.path.join(workdir, "answer.json"), "w", encoding="utf-8") as handle:
                     json.dump(match["answer"], handle)
             else:
-                cache = ContentCache(threshold=args.content_threshold, seed=args.seed) \
-                    if use_content else None
+                cache = None
+                cache_init_seconds = 0.0
+                if use_content:
+                    initialized = time.perf_counter()
+                    cache = ContentCache(threshold=args.content_threshold, seed=args.seed)
+                    cache_init_seconds = time.perf_counter() - initialized
                 try:
-                    row.update(run_agent(args, workdir, session_path, cache))
+                    run_agent(args, workdir, session_path, cache, row)
                 except Exception as error:    # an API failure is a failed task, not a crash
                     row["error"] = "%s: %s" % (type(error).__name__, error)
                 if cache:
-                    row.update(content_seconds=cache.stats["seconds"],
+                    row.update(content_seconds=cache_init_seconds + cache.stats["seconds"],
                                content_chars_in=cache.stats["chars_in"],
                                content_chars_out=cache.stats["chars_out"],
                                content_folds=cache.stats["folded"])
-            row["seconds"] = time.perf_counter() - started
+            row["seconds"] = time.perf_counter() - started + policy_init_seconds
+            policy_init_seconds = 0.0         # charge once, to the first new task
             row["passed"] = verify(args, dataset, tid, workdir)
             if policy and row["passed"] and read_answer(workdir):  # only verified answers are indexed
                 added = time.perf_counter()
                 policy.add(task, read_answer(workdir))
-                row["policy_seconds"] += time.perf_counter() - added
-                row["seconds"] += time.perf_counter() - added
+                add_seconds = time.perf_counter() - added
+                row["policy_seconds"] += add_seconds
+                row["seconds"] += add_seconds
             log.write(json.dumps(row) + "\n")
             log.flush()
             print("%-9s %-9s %s %s %s %.1fs" % (
                 config, dataset, tid, "PASS" if row["passed"] else "FAIL",
-                "reused from %s" % row["source"] if row["reused"] else
+                "reused (%s) from %s" % (row["reuse_layer"], row["source"]) if row["reused"] else
                 "%d requests, %d tool calls, %d input tokens" % (
                     row["model_requests"], row["tool_calls"], row["input_tokens"]),
                 row["seconds"]), flush=True)
@@ -182,7 +205,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="seed of the MinHash hash functions")
     parser.add_argument("--model", default=MODEL)
     parser.add_argument("--threshold", type=float, default=0.5,
-                        help="task-level: estimated Jaccard a record needs to be considered")
+                        help="task-level: estimated Jaccard a record needs")
+    parser.add_argument("--no-key-rule", default="exact", choices=["exact", "similarity"],
+                        help="task-level, data without key fields: same text, or similarity alone")
     parser.add_argument("--content-threshold", type=float, default=0.5,
                         help="content-level: estimated Jaccard an earlier output needs")
     parser.add_argument("--max-turns", type=int, default=40, help="agent turn limit per task")
